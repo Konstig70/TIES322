@@ -1,4 +1,5 @@
 ### Code for excersice Reliability on top of UDP.
+Points: 12/60
 
 #### Currently done:
 - Virtual Socket: Everything done!
