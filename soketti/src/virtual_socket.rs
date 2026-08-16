@@ -19,17 +19,23 @@ pub struct VirtualSocket {
 //Method implementations
 impl VirtualSocket {
     pub fn new(addr: &str) -> Result<Self> {
+        /*
+         * Constructor
+         * */
         let true_socket = UdpSocket::bind(addr)?;
         Ok(Self {
             true_socket,
-            p_drop: 0.5,
-            p_delay: 0.8,
-            p_bit_err: 0.6,
+            p_drop: 0.0,
+            p_delay: 0.0,
+            p_bit_err: 0.8,
             rng: rand::rng(),
         })  
     }
 
     pub fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddr)> { 
+        /* 
+         * Receives data from socket, is also able to simulate delay, bit error, etc.
+         * */
         loop {
             // Read from actual socket
             let (am, addr) = self.true_socket.recv_from(buffer)?;
@@ -54,7 +60,7 @@ impl VirtualSocket {
                 rnd_num = self.rng.random();
                 if rnd_num < self.p_bit_err {
                     let byte_idx = self.rng.random_range(0..=am);
-                    let bit_idx = self.rng.random_range(0..=8);
+                    let bit_idx = self.rng.random_range(0..=7);
                     buffer[byte_idx] ^= 1 << bit_idx;
                 }
                 return Ok((am, addr));
