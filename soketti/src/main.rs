@@ -13,13 +13,55 @@ fn main() -> std::io::Result<()> {
             let filled_buf = &mut buffer[..am-1];
             let msg = String::from_utf8_lossy(filled_buf);
             println!("Received {} bytes from {}: {:?}", am, addr, msg);
-            println!("Last bit: {}", buffer[am-1]);
-            let checksum = check_for_bit_errors(&mut buffer[..am]);
-            if checksum != 0 {
-                println!("Bit error in message! Checksum was {}", checksum)
+            // println!("Last bit: 0x{:02x}", buffer[am-1]);
+            let checksum = check_for_bit_errors(&buffer[..am]);
+            let success = checksum == 0;  
+            if !success {
+                println!("Bit error in message! Checksum was {}", checksum);
+            }
+            
+            let ack_packet = hanlde_ack_or_nack(success);
+            handle_only_ack(success, &buffer);
+
+            match socket.send_ack(addr, &ack_packet) {
+                Ok(_) => println!("Sent {} to {addr}", String::from_utf8_lossy(&ack_packet)),
+                Err(e) => eprintln!("Error {e}")
             }
         }
     }
+}
+
+fn handle_only_ack(success: bool, message: &[u8]) -> ([u8; 4], u8) {
+    /* 
+     * Handles message received status, always ACK 
+     * */
+
+    //E
+}
+
+fn hanlde_ack_or_nack(success: bool) -> [u8; 4] {
+    /* 
+     * Handles message received status returns either a NACK or ACK packet
+     * */        
+    let buff: &[u8] = if success {
+        b"ACK"
+    } 
+    else {
+        b"NAK"
+    };
+
+    // println!("crc8 for {} is: {crc8}", String::from_utf8_lossy(buff));
+    let mut ack_packet = [0u8; 4];
+    ack_packet[0..3].copy_from_slice(buff);
+    ack_packet[3] = if success {
+        0x7f
+    }
+    else {
+        0x12
+    };
+
+    ack_packet
+
 }
 
 fn check_for_bit_errors(data: &[u8]) -> u8 {

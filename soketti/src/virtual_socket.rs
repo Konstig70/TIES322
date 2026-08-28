@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::{net::UdpSocket};
 use std::io::Result;
-use std::thread;
+use std::{thread, usize};
 use std::time::Duration;
 use rand::RngExt;
 use rand::rngs::ThreadRng;
@@ -13,7 +13,7 @@ pub struct VirtualSocket {
     p_drop: f64, // Probability to drop packet
     p_delay: f64, // Probability of delay 
     p_bit_err: f64,  // Probability of a bit error happening
-    rng: ThreadRng 
+    rng: ThreadRng,  // The actual rng object
 }
 
 //Method implementations
@@ -27,9 +27,15 @@ impl VirtualSocket {
             true_socket,
             p_drop: 0.0,
             p_delay: 0.0,
-            p_bit_err: 0.8,
+            p_bit_err: 0.5,
             rng: rand::rng(),
         })  
+    }
+
+    pub fn send_ack(&mut self, addr: SocketAddr, buff: &[u8]) -> Result<usize> {
+        // println!("Sending acknowledgement back to {}", addr);
+        
+        self.true_socket.send_to(&buff, addr)
     }
 
     pub fn recv_from(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddr)> { 
