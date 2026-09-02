@@ -27,9 +27,21 @@ impl VirtualSocket {
             true_socket,
             p_drop: 0.0,
             p_delay: 0.0,
-            p_bit_err: 0.5,
+            p_bit_err: 0.0,
             rng: rand::rng(),
         })  
+    }
+
+    pub fn set_timer(&self, dur: Duration) {
+        self.true_socket.set_read_timeout(Some(dur)).unwrap(); // This can also panic but we dont
+                                                               // care :).
+    }
+
+    pub fn send_msg(&self, buf: &Vec<u8>, addr: SocketAddr) -> Result<usize> {
+        /* 
+         * Sends data to specified address from UDP socket
+         * */
+        self.true_socket.send_to(buf, addr)
     }
 
     pub fn send_ack(&mut self, addr: SocketAddr, buff: &[u8]) -> Result<usize> {

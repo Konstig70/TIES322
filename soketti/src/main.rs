@@ -1,20 +1,30 @@
 mod virtual_socket;
+use std::{net::SocketAddr, time::Duration};
 
 use virtual_socket::VirtualSocket;
-use std::io::{self, Write};
+use std::{io::{self, Write}};
 
 // Stores all rdt versions
 pub enum RdtVersion {
     AckNack,
     AckOnly,   
-    NackOnly,  
+    NackOnly,
+    FullRdt,
 }
 
 fn main() -> std::io::Result<()> {
     {
-        let mut socket = VirtualSocket::new("0.0.0.0:8080")?;
+        let mut socket = VirtualSocket::new("127.0.0.1:8080")?;
         let rdt_version = get_rdt_version_from_user();
         let mut latest_sequence = 0x01; //Assume latest sequence number is 1 
+        
+        match rdt_version {
+            // rdt 3.0 is identical to 2.2 on the receiver end, so we need a totally different
+            // functionality
+            
+            RdtVersion::FullRdt => {full_rdt(&mut socket)} 
+            _ => {} 
+        }
         loop {
             println!("Listening...");
             let mut buffer = [0; 256];
@@ -23,7 +33,7 @@ fn main() -> std::io::Result<()> {
             let filled_buf = &mut buffer[..am-1];
             let msg = String::from_utf8_lossy(filled_buf);
             println!("Received {} bytes from {}: {:?}", am, addr, msg);
-            //println!("Last bit: 0x{:02x}", buffer[am-1]);
+            println!("Last bit: 0x{:02x}", buffer[am-1]);
             let checksum = check_for_bit_errors(&buffer[..am]);
             let success = checksum == 0;  
             if !success {
@@ -62,12 +72,106 @@ fn main() -> std::io::Result<()> {
                         None => println!("No errors so not sending anything")
                     }
                 }
+
+                RdtVersion::FullRdt => {}
             }
         }
     }
 }
 
-pub fn get_rdt_version_from_user() -> RdtVersion {
+fn full_rdt(socket: &mut VirtualSocket) {
+    /* 
+     * Full rdt 3.0 with message sending etc.
+     * */
+
+    // Set up 
+    let receiver_addr: SocketAddr = "127.0.0.1:36516".parse().expect("Failed to parse");    
+    socket.set_timer(Duration::from_secs(5));
+
+    let mut latest_sequence = 0x00;
+    let mut next_sequence = 0x01;
+    loop {
+        print!("Input message>");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        
+        // Read the user's input
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read line");
+        input = String::from(input.trim_end());
+
+        // Get bytes
+        let input_bytes = input.as_bytes();
+
+        // Create buffer with seq and crc8
+        let mut buffer = Vec::with_capacity(1 + input_bytes.len() + 1);
+        buffer.push(latest_sequence);
+        buffer.extend_from_slice(input_bytes);
+        buffer.push(0x00); // Need to push 0 byte here to get enough length for the buffer
+        let crc8 = check_for_bit_errors(&buffer);
+        *buffer.last_mut().unwrap() = crc8; // This can panic but we want the software to crash
+                                            // then. No need to build safety here.
+
+        let mut send_success = false;
+
+        // Repeat this until seding is successful
+        while !send_success {
+
+            // Send via virtual socket 
+            match socket.send_msg(&buffer, receiver_addr) {
+                Ok(am) => println!("Wrote {am} bytes"),
+                Err(e) => eprintln!("Error: {e}")
+            }
+
+            // Similar to what we did before 
+            let mut buffer = [0; 256];
+            match socket.recv_from(&mut buffer) {
+                Ok((am ,addr)) => {
+                    let filled_buf = &mut buffer.clone()[..am-1]; // Need to clone buffer here
+                                                                  // since it gets passed around
+                                                                  // to many functions
+                    let msg = String::from_utf8_lossy(filled_buf);
+                    let checksum = check_for_bit_errors(&buffer[..am]); // Immutable borrow of
+                                                                        // buffer
+                    let success = checksum == 0;  
+                    if !success {
+                        println!("Received: {msg}. Bit error detected! Checksum was {}, resending message...", checksum);  // This print mutable borrows buffer so we needed to clone it 
+ 
+                    }
+                    else {
+                        println!("Received {} bytes from {}: {:?}", am, addr, msg);
+                        
+                        // Verify ACK Packet 
+                        if filled_buf[0] == latest_sequence {
+                            println!("ACK has correct seq, success!");
+                            send_success = true
+                        }
+                        else {
+                            println!("ACK has incorrect seq, resending message...")
+                        }
+                    }
+                    
+                },
+                
+                // Techincally a network error causes this arm to trigger also but resending in that case is
+                // also valid. println could be better tho...
+                Err(_) => println!("Timer expired, resending message...")
+
+            }         
+            
+        }
+
+        // Swap latest and next
+        let helper = latest_sequence;
+        latest_sequence = next_sequence;
+        next_sequence = helper;
+
+    }
+}
+
+fn get_rdt_version_from_user() -> RdtVersion {
     /*
      * Interactive Menu for testing application. One shotted by gemini (since this has nothing to
      * do with the learning objectives of the course I asked AI to help generate this :-))
@@ -78,7 +182,8 @@ pub fn get_rdt_version_from_user() -> RdtVersion {
         println!("1: Reliable data transfer with positive and negative ACKs");
         println!("2: Reliable data transfer with only positive ACKs");
         println!("3: Reliable data transfer with only negative ACKs");
-        print!("Enter 1, 2, or 3: ");
+        println!("4: Fully reliable data transfer with both ACKs and NACKs");
+        print!("Enter 1, 2, 3 or 4: ");
         
         // Flush stdout to ensure the print! macro displays before taking input
         io::stdout().flush().unwrap();
@@ -95,6 +200,7 @@ pub fn get_rdt_version_from_user() -> RdtVersion {
             "1" => return RdtVersion::AckNack,
             "2" => return RdtVersion::AckOnly,
             "3" => return RdtVersion::NackOnly,
+            "4" => return RdtVersion::FullRdt,
             _ => println!("Invalid input. Please type 1, 2, or 3."),
         }
     }
@@ -184,7 +290,7 @@ fn check_for_bit_errors(data: &[u8]) -> u8 {
         0x02,
         0x01,
     ];
-
+    println!("data length: {}", data.len());
     let mut register: u8= 0; // Initiaze register
     for &byte in data {
         for i in 0..8 {
