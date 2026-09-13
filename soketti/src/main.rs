@@ -1,8 +1,11 @@
 mod virtual_socket;
-use std::{net::SocketAddr, time::Duration};
-
+use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
+use std::sync::Mutex;
 use virtual_socket::VirtualSocket;
 use std::{io::{self, Write}};
+
+const RECEIVER_ADDR: &str = "127.0.0.1:8080";
+const OWN_ADDR: &str = "127.0.0.1:7878";
 
 // Stores all rdt versions
 pub enum RdtVersion {
@@ -10,19 +13,24 @@ pub enum RdtVersion {
     AckOnly,   
     NackOnly,
     FullRdt,
+    GbnReceiver,
+    GbnSender,
 }
 
 fn main() -> std::io::Result<()> {
     {
-        let mut socket = VirtualSocket::new("127.0.0.1:8080")?;
+        let mut socket = VirtualSocket::new(OWN_ADDR)?;
         let rdt_version = get_rdt_version_from_user();
         let mut latest_sequence = 0x01; //Assume latest sequence number is 1 
-        
+        let mut gbn_latest_seq = 0xFE; // Since we start indexing at 0 we need to init. this as a
+                                       // high number
+        let mut gbn_next_seq = 0x00;
         match rdt_version {
             // rdt 3.0 is identical to 2.2 on the receiver end, so we need a totally different
             // functionality
             
             RdtVersion::FullRdt => {full_rdt(&mut socket)} 
+            RdtVersion::GbnSender => {gbn_sender(&mut socket)}
             _ => {} 
         }
         loop {
@@ -73,10 +81,203 @@ fn main() -> std::io::Result<()> {
                     }
                 }
 
-                RdtVersion::FullRdt => {}
+                // Go back N receiver similar to RDT 2.2 except Seq numbers are not limited to 0
+                // and 1 
+                RdtVersion::GbnReceiver => {
+                    let (ack_packet, seq, next_seq) = gbn_handle_recv(success, &buffer, gbn_latest_seq, gbn_next_seq);
+                    gbn_latest_seq = seq;
+                    gbn_next_seq = next_seq;
+
+                    match socket.send_ack(addr, &ack_packet) {
+                        Ok(_) => println!("Sent {} to {addr}", String::from_utf8_lossy(&ack_packet)),
+                        Err(e) => eprintln!("Error {e}")
+                    }
+
+                }
+
+                _ => {}
             }
         }
     }
+}
+
+fn gbn_handle_recv(success: bool, message: &[u8], latest_seq_num: u8, next_seq_num: u8) -> ([u8; 5], u8, u8) {
+    /* 
+     * GBN receiver. 
+     * */
+    if success {
+        // Extract sequence number from packet
+        let sequence_number = message[0];
+        
+        if sequence_number == next_seq_num {
+            let buff: &[u8] = b"ACK";
+            let mut ack_packet = [0u8; 5];
+            ack_packet[1..4].copy_from_slice(buff);
+        
+            // Put sequence number as the first byte and CRC8 as the last 
+            ack_packet[0] = sequence_number;
+            let crc8 = check_for_bit_errors(&ack_packet);
+            ack_packet[4] = crc8;
+            return (ack_packet, next_seq_num, next_seq_num + 0x01);
+
+        }
+    } 
+    
+    // Packet was not received properly send ACK of the previous packet 
+    let buff: &[u8] = b"ACK";
+    let mut ack_packet = [0u8; 5];
+    ack_packet[1..4].copy_from_slice(buff);
+    ack_packet[0] = latest_seq_num;
+    let crc8 = check_for_bit_errors(&ack_packet);
+    ack_packet[4] = crc8;
+    
+    // Also return the latest sequence here
+    return (ack_packet, latest_seq_num, next_seq_num);
+
+}
+
+pub struct WindowState {
+    pub current_seq_num: u8,
+    pub next_seq_num: u8,
+    pub window_size: u8,
+    pub unacked_packets: Vec<Vec<u8>>,
+}
+
+fn gbn_sender(socket: &mut VirtualSocket) {
+    /* 
+     * Go Back N sender client. separated sender and receiver for clarity
+     * */
+    
+    // Setup Window state
+    // 5 messages at a time for now
+    let window_size: usize = 5;
+    let state = WindowState{
+        current_seq_num: 0,
+        next_seq_num: 0,
+        window_size: window_size as u8,
+        unacked_packets: Vec::with_capacity(window_size),
+    };
+
+    let mutex_state = Arc::new(Mutex::new(state));
+    let cloned_mutex_state = mutex_state.clone();
+    // Setup listener   
+    let mut listener_socket = socket.try_clone();    
+    // Set listening to another thread
+    thread::spawn(move || {
+        println!("Starting listener socket...");
+
+        // Set timeout
+        listener_socket.set_timer(Duration::from_secs(20));
+        
+        loop {
+
+            // Receive from socket 
+            let mut buffer = [0; 256];
+            match listener_socket.recv_from(&mut buffer) {
+                Ok((am, addr)) => {
+                    let filled_buf = &mut buffer.clone()[..am-1];
+                    let msg = String::from_utf8_lossy(filled_buf);
+                    println!("Received {} bytes from {}: {:?}", am, addr, msg);
+                    println!("Last bit: 0x{:02x}", buffer[am-1]);
+            
+                    // Checksum 
+                    let checksum = check_for_bit_errors(&buffer[..am]);
+                    let success = checksum == 0;  
+                    if success {
+                        let mut curr_state = cloned_mutex_state.lock().expect("Thread Poisoned!");
+                
+                        // Get Seq num from ACK 
+                        let seq_num = filled_buf[0];
+
+                        // Only accept current seq num or higher, since 
+                        if seq_num >= curr_state.current_seq_num &&
+                            seq_num < (curr_state.window_size + curr_state.current_seq_num){
+
+                            // increment necessary data only if seq_num matches 
+                            curr_state.current_seq_num = seq_num + 0x01;
+                            curr_state.unacked_packets.retain(|packet| packet[0] > seq_num);
+                        }
+
+                    } else {
+                        println!("Bit error in message! Checksum was {}", checksum);
+
+                    } 
+
+                }
+
+                Err(_) => {
+                    // Logic for resending packets
+                    println!("Timer ran out, resending packets!");
+
+                    {
+                        let curr_state = cloned_mutex_state.lock().expect("Thread poisoned!");
+                        let receiver_addr: SocketAddr = RECEIVER_ADDR.parse().expect("Failed to parse");    
+
+                        for unack_packet in &curr_state.unacked_packets {
+                            match listener_socket.send_msg(&unack_packet, receiver_addr) {
+                                Ok(am) => println!("Wrote {am} bytes"),
+                                Err(e) => eprintln!("Error: {e}")
+                            }
+                        } 
+                    }
+                }
+            }
+        
+        }
+        
+    });
+
+    // Setup sending 
+    let receiver_addr: SocketAddr = RECEIVER_ADDR.parse().expect("Failed to parse");    
+    
+    loop {
+        print!("Input message>");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        
+        // Read the user's input
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read line");
+        input = String::from(input.trim_end());
+        // Get bytes
+        let input_bytes = input.as_bytes();
+
+        // Create buffer variable here since it needs to live longer
+        let mut buffer = Vec::with_capacity(1 + input_bytes.len() + 1);
+        
+        {
+            let mut curr_state = mutex_state.lock().expect("Cannot lock something went wrong");
+
+            // Only send when we have space. not very user intuitive but will do for now
+            if (curr_state.next_seq_num as usize) < 
+                (curr_state.current_seq_num as usize) + (curr_state.window_size as usize) {
+                
+                // Prepare buffer with data, sequence and crc8 
+                buffer.push(curr_state.next_seq_num);
+                buffer.extend_from_slice(input_bytes);
+                buffer.push(0x00); // Need to push 0 byte here to get enough length for the buffer
+                let crc8 = check_for_bit_errors(&buffer);
+                *buffer.last_mut().unwrap() = crc8; // This can panic but we want the software to crash
+        
+
+                //Increment necessary data:
+                curr_state.next_seq_num += 0x01;
+                curr_state.unacked_packets.push(buffer.clone());
+            } else {
+                println!("Window full please retype the message");
+                continue;
+            }
+        } // curr_state gets dropped here so mutex gets unlocked        
+        
+        // Send via virtual socket. Sending is a network operation so it shouldnt lock the mutex 
+        match socket.send_msg(&buffer, receiver_addr) {
+            Ok(am) => println!("Wrote {am} bytes"),
+            Err(e) => eprintln!("Error: {e}")
+        }
+    }
+
 }
 
 fn full_rdt(socket: &mut VirtualSocket) {
@@ -183,7 +384,9 @@ fn get_rdt_version_from_user() -> RdtVersion {
         println!("2: Reliable data transfer with only positive ACKs");
         println!("3: Reliable data transfer with only negative ACKs");
         println!("4: Fully reliable data transfer with both ACKs and NACKs");
-        print!("Enter 1, 2, 3 or 4: ");
+        println!("5: Gbn sender");
+        println!("6: Gbn receiver");
+        print!("Enter 1, 2, 3, 4, 5 or 6: ");
         
         // Flush stdout to ensure the print! macro displays before taking input
         io::stdout().flush().unwrap();
@@ -201,7 +404,9 @@ fn get_rdt_version_from_user() -> RdtVersion {
             "2" => return RdtVersion::AckOnly,
             "3" => return RdtVersion::NackOnly,
             "4" => return RdtVersion::FullRdt,
-            _ => println!("Invalid input. Please type 1, 2, or 3."),
+            "5" => return RdtVersion::GbnSender,
+            "6" => return RdtVersion::GbnReceiver,
+            _ => println!("Invalid input. Please type 1, 2, 3, 4, 5 or 6."),
         }
     }
 }
@@ -290,7 +495,6 @@ fn check_for_bit_errors(data: &[u8]) -> u8 {
         0x02,
         0x01,
     ];
-    println!("data length: {}", data.len());
     let mut register: u8= 0; // Initiaze register
     for &byte in data {
         for i in 0..8 {

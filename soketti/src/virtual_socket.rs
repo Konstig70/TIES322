@@ -3,8 +3,7 @@ use std::{net::UdpSocket};
 use std::io::Result;
 use std::{thread, usize};
 use std::time::Duration;
-use rand::RngExt;
-use rand::rngs::ThreadRng;
+use rand::{RngExt};
 
 // Rust does not support inheritance the same way that Java etc. support so we need to make a
 // Wrapper
@@ -13,7 +12,6 @@ pub struct VirtualSocket {
     p_drop: f64, // Probability to drop packet
     p_delay: f64, // Probability of delay 
     p_bit_err: f64,  // Probability of a bit error happening
-    rng: ThreadRng,  // The actual rng object
 }
 
 //Method implementations
@@ -28,13 +26,21 @@ impl VirtualSocket {
             p_drop: 0.0,
             p_delay: 0.0,
             p_bit_err: 0.0,
-            rng: rand::rng(),
         })  
     }
 
     pub fn set_timer(&self, dur: Duration) {
         self.true_socket.set_read_timeout(Some(dur)).unwrap(); // This can also panic but we dont
                                                                // care :).
+    }
+
+    pub fn try_clone(&self) -> VirtualSocket {
+        VirtualSocket {
+            p_drop: self.p_drop,
+            p_delay: self.p_delay,
+            p_bit_err: self.p_bit_err,
+            true_socket: self.true_socket.try_clone().unwrap(),
+        }
     }
 
     pub fn send_msg(&self, buf: &Vec<u8>, addr: SocketAddr) -> Result<usize> {
@@ -57,7 +63,8 @@ impl VirtualSocket {
         loop {
             // Read from actual socket
             let (am, addr) = self.true_socket.recv_from(buffer)?;
-            let mut rnd_num: f64 = self.rng.random();       
+
+            let mut rnd_num = rand::rng().random::<f64>();
             
             // Drop the packet randomly
             if rnd_num < self.p_drop {
@@ -67,18 +74,18 @@ impl VirtualSocket {
             else {
                 
                 // Delay
-                rnd_num = self.rng.random();
+                rnd_num = rand::rng().random::<f64>();
                 if rnd_num < self.p_delay {
                     print!("Delaying...");
-                    thread::sleep(Duration::from_secs(self.rng.random_range(1..=5))); // Delay of 1
+                    thread::sleep(Duration::from_secs(rand::rng().random_range(1..=5))); // Delay of 1
                     println!("Finished")                                             // to 5 secs
                 }
 
                 // Bit error 
-                rnd_num = self.rng.random();
+                rnd_num = rand::rng().random::<f64>();
                 if rnd_num < self.p_bit_err {
-                    let byte_idx = self.rng.random_range(0..=am);
-                    let bit_idx = self.rng.random_range(0..=7);
+                    let byte_idx = rand::rng().random_range(1..=5);
+                    let bit_idx = rand::rng().random_range(1..=5);
                     buffer[byte_idx] ^= 1 << bit_idx;
                 }
                 return Ok((am, addr));
