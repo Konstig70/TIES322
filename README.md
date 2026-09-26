@@ -1,2 +1,2 @@
 ## This repo contains all the code for excersices in JYU's Course TIES322
-Points currently: 24
+Points currently: 60
